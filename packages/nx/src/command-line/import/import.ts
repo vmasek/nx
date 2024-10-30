@@ -29,6 +29,7 @@ import {
   needsInstall,
 } from './utils/needs-install';
 import { readPackageJson } from '../../project-graph/file-utils';
+import { readJsonFile } from '../../utils/fileutils';
 
 const importRemoteName = '__tmp_nx_import__';
 
@@ -193,8 +194,22 @@ export async function importHandler(options: ImportOptions) {
   }
 
   const absDestination = join(process.cwd(), destination);
+  const relativeDestination = relative(
+    destinationGitClient.root,
+    absDestination
+  );
+
+  const packageManager = detectPackageManager(workspaceRoot);
+  const pmc = getPackageManagerCommand();
 
   await assertDestinationEmpty(destinationGitClient, absDestination);
+
+  await handleMissingWorkspacesEntry(
+    packageManager,
+    pmc,
+    relativeDestination,
+    join(sourceRepository, source)
+  );
 
   const tempImportBranch = getTempImportBranch(ref);
   await sourceGitClient.addFetchRemote(importRemoteName, ref);
@@ -218,18 +233,12 @@ export async function importHandler(options: ImportOptions) {
     );
   }
 
-  const packageManager = detectPackageManager(workspaceRoot);
-
   const originalPackageWorkspaces = await getPackagesInPackageManagerWorkspace(
     packageManager
   );
 
   const sourceIsNxWorkspace = existsSync(join(sourceGitClient.root, 'nx.json'));
 
-  const relativeDestination = relative(
-    destinationGitClient.root,
-    absDestination
-  );
   await prepareSourceRepo(
     sourceGitClient,
     ref,
@@ -259,7 +268,6 @@ export async function importHandler(options: ImportOptions) {
   await destinationGitClient.deleteGitRemote(importRemoteName);
   spinner.succeed('Cleaned up temporary files and remotes');
 
-  const pmc = getPackageManagerCommand();
   const nxJson = readNxJson(workspaceRoot);
 
   resetWorkspaceContext();
@@ -326,8 +334,6 @@ export async function importHandler(options: ImportOptions) {
     });
   }
 
-  await warnOnMissingWorkspacesEntry(packageManager, pmc, relativeDestination);
-
   if (source != destination) {
     output.warn({
       title: `Check configuration files`,
@@ -392,42 +398,67 @@ async function createTemporaryRemote(
   await destinationGitClient.fetch(remoteName);
 }
 
-// If the user imports a project that isn't in NPM/Yarn/PNPM workspaces, then its dependencies
-// will not be installed. We should warn users and provide instructions on how to fix this.
-async function warnOnMissingWorkspacesEntry(
+/**
+ * If the user imports a project that isn't in NPM/Yarn/PNPM workspaces, then its dependencies
+ * will not be installed. We should warn users and provide instructions on how to fix this.
+ * If the user imports a project that isn't in the workspaces entry, we should warn users and provide instructions on how to fix this.
+ * If the user imports a project that has uninstalled dependencies, we should throw an error because there would be an error for modules not found.
+ */
+async function handleMissingWorkspacesEntry(
   pm: PackageManager,
   pmc: PackageManagerCommands,
-  pkgPath: string
+  pkgPath: string,
+  sourcePath: string
 ) {
+  let constainsUninstalledDep = false;
+  let errorTitle = '';
+  let messageBodyLines: string[] = [];
+
+  try {
+    const sourcePackageJson = readJsonFile(join(sourcePath, 'package.json'));
+    const sourcePackageDeps = [
+      ...Object.keys(sourcePackageJson.dependencies ?? {}),
+      ...Object.keys(sourcePackageJson.devDependencies ?? {}),
+    ];
+    const destinationPackageJson = readPackageJson();
+    const destinationPackageDeps = [
+      ...Object.keys(destinationPackageJson.dependencies ?? {}),
+      ...Object.keys(destinationPackageJson.devDependencies ?? {}),
+    ];
+    constainsUninstalledDep = !!sourcePackageDeps.find(
+      (dep) => !destinationPackageDeps.includes(dep)
+    );
+  } catch {
+    return {}; // if package.json doesn't exist
+  }
+
   if (!isWorkspacesEnabled(pm, workspaceRoot)) {
-    output.warn({
-      title: `Missing workspaces in package.json`,
-      bodyLines:
-        pm === 'npm'
-          ? [
-              `We recommend enabling NPM workspaces to install dependencies for the imported project.`,
-              `Add \`"workspaces": ["${pkgPath}"]\` to package.json and run "${pmc.install}".`,
-              `See: https://docs.npmjs.com/cli/using-npm/workspaces`,
-            ]
-          : pm === 'yarn'
-          ? [
-              `We recommend enabling Yarn workspaces to install dependencies for the imported project.`,
-              `Add \`"workspaces": ["${pkgPath}"]\` to package.json and run "${pmc.install}".`,
-              `See: https://yarnpkg.com/features/workspaces`,
-            ]
-          : pm === 'bun'
-          ? [
-              `We recommend enabling Bun workspaces to install dependencies for the imported project.`,
-              `Add \`"workspaces": ["${pkgPath}"]\` to package.json and run "${pmc.install}".`,
-              `See: https://bun.sh/docs/install/workspaces`,
-            ]
-          : [
-              `We recommend enabling PNPM workspaces to install dependencies for the imported project.`,
-              `Add the following entry to to pnpm-workspace.yaml and run "${pmc.install}":`,
-              chalk.bold(`packages:\n  - '${pkgPath}'`),
-              `See: https://pnpm.io/workspaces`,
-            ],
-    });
+    errorTitle = `Missing workspaces in package.json`;
+    messageBodyLines =
+      pm === 'npm'
+        ? [
+            `We recommend enabling NPM workspaces to install dependencies for the imported project.`,
+            `Add \`"workspaces": ["${pkgPath}"]\` to package.json and run "${pmc.install}".`,
+            `See: https://docs.npmjs.com/cli/using-npm/workspaces`,
+          ]
+        : pm === 'yarn'
+        ? [
+            `We recommend enabling Yarn workspaces to install dependencies for the imported project.`,
+            `Add \`"workspaces": ["${pkgPath}"]\` to package.json and run "${pmc.install}".`,
+            `See: https://yarnpkg.com/features/workspaces`,
+          ]
+        : pm === 'bun'
+        ? [
+            `We recommend enabling Bun workspaces to install dependencies for the imported project.`,
+            `Add \`"workspaces": ["${pkgPath}"]\` to package.json and run "${pmc.install}".`,
+            `See: https://bun.sh/docs/install/workspaces`,
+          ]
+        : [
+            `We recommend enabling PNPM workspaces to install dependencies for the imported project.`,
+            `Add the following entry to to pnpm-workspace.yaml and run "${pmc.install}":`,
+            chalk.bold(`packages:\n  - '${pkgPath}'`),
+            `See: https://pnpm.io/workspaces`,
+          ];
   } else {
     // Check if the new package is included in existing workspaces entries. If not, warn the user.
     let workspaces: string[] | null = null;
@@ -448,20 +479,32 @@ async function warnOnMissingWorkspacesEntry(
       const isPkgIncluded = workspaces.some((w) => minimatch(pkgPath, w));
       if (!isPkgIncluded) {
         const pkgsDir = dirname(pkgPath);
-        output.warn({
-          title: `Project missing in workspaces`,
-          bodyLines:
-            pm === 'npm' || pm === 'yarn' || pm === 'bun'
-              ? [
-                  `The imported project (${pkgPath}) is missing the "workspaces" field in package.json.`,
-                  `Add "${pkgsDir}/*" to workspaces run "${pmc.install}".`,
-                ]
-              : [
-                  `The imported project (${pkgPath}) is missing the "packages" field in pnpm-workspaces.yaml.`,
-                  `Add "${pkgsDir}/*" to packages run "${pmc.install}".`,
-                ],
-        });
+        errorTitle = `Project missing in workspaces`;
+        messageBodyLines =
+          pm === 'npm' || pm === 'yarn' || pm === 'bun'
+            ? [
+                `The imported project (${pkgPath}) is missing the "workspaces" field in package.json.`,
+                `Add "${pkgsDir}/*" to workspaces run "${pmc.install}".`,
+              ]
+            : [
+                `The imported project (${pkgPath}) is missing the "packages" field in pnpm-workspaces.yaml.`,
+                `Add "${pkgsDir}/*" to packages run "${pmc.install}".`,
+              ];
       }
     }
+  }
+
+  if (constainsUninstalledDep) {
+    throw new Error(
+      `Source ${join(
+        sourcePath,
+        'package.json'
+      )}  has dependencies not installed by workspace. ${messageBodyLines.join(
+        ` `
+      )}`
+    );
+  }
+  if (errorTitle) {
+    output.warn({ title: errorTitle, bodyLines: messageBodyLines });
   }
 }
